@@ -1,12 +1,16 @@
 import streamlit as st
 from neo4j import GraphDatabase
 import pandas as pd
-from fuzzywuzzy import process
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 # --- Configuration ---
-NEO4J_URI = "neo4j+s://926182d4.databases.neo4j.io"
-NEO4J_USER = "neo4j"
-NEO4J_PASSWORD = "D7JTWEchFDbZS6oI0_TyKYS1sEpWMJQ1GozX8r39ysA"
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+
 st.set_page_config(page_title="Movie Recommender", layout="wide")
 # Neo4j driver
 @st.cache_resource
