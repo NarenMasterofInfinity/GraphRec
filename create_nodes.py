@@ -1,109 +1,115 @@
-
-
 import pandas as pd
-import itertools
+import numpy as np
+import networkx as nx
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from community import community_louvain
 from neo4j import GraphDatabase
-from sentence_transformers import SentenceTransformer, util
+from tqdm import tqdm
+from dotenv import load_dotenv
+import os
 
-NEO4J_URI      = "neo4j+s://926182d4.databases.neo4j.io"
-NEO4J_USER     = "neo4j"
-NEO4J_PASSWORD = "D7JTWEchFDbZS6oI0_TyKYS1sEpWMJQ1GozX8r39ysA"
+load_dotenv()
 
-MOVIES_CSV     = "movies.csv"
-SIM_THRESHOLD  = 0.4
+# --- Configuration ---
+URI = os.getenv("NEO4J_URI")
+USER = os.getenv("NEO4J_USER")
+PASSWORD = os.getenv("NEO4J_PASSWORD")
 
-
-W_OVERVIEW     = 0.4
-W_DIRECTOR     = 0.2
-W_GENRE        = 0.2
-W_STARS        = 0.2
-
-df = pd.read_csv(MOVIES_CSV).fillna("")
-
-df["Genres"] = df["Genre"].apply(lambda s: [g.strip() for g in s.split(",") if g.strip()])
-df["Stars"]  = df[["Star1","Star2","Star3","Star4"]].apply(lambda row: [x for x in row if x], axis=1)
-
-titles = df["Series_Title"].tolist()
+THRESHOLD = 0.4
+EMB_WEIGHT = 0.4
+DIRECTOR_WEIGHT = 0.2
+GENRE_WEIGHT = 0.2
+STARS_WEIGHT = 0.2
 
 
+# Load data
+df = pd.read_csv("movies.csv")
+df.fillna("", inplace=True)
+
+# Normalize lists
+df['Genre'] = df['Genre'].apply(lambda x: [g.strip() for g in x.split(',')])
+df['Stars'] = df[['Star1', 'Star2', 'Star3', 'Star4']].values.tolist()
+
+# Compute embeddings
 model = SentenceTransformer('all-MiniLM-L6-v2')
-embeddings = model.encode(df["Overview"].tolist(), convert_to_tensor=True)
+embeddings = model.encode(df['Overview'].tolist(), show_progress_bar=True)
 
+# Graph init
+G = nx.Graph()
 
-edges = []
-for i, j in itertools.combinations(range(len(df)), 2):
+# Add nodes
+for idx, row in df.iterrows():
+    G.add_node(row['Series_Title'], **{
+        'title': row['Series_Title'],
+        'director': row['Director'],
+        'genre': row['Genre'],
+        'stars': row['Stars'],
+        'rating': row['IMDB_Rating']
+    })
 
-    ov_sim = util.cos_sim(embeddings[i], embeddings[j]).item()
-    if ov_sim < SIM_THRESHOLD:
-        continue
+# Compute hybrid similarity
+for i in tqdm(range(len(df))):
+    for j in range(i+1, len(df)):
+        # Embedding similarity
+        sim_emb = cosine_similarity([embeddings[i]], [embeddings[j]])[0][0]
+        
+        # Director match
+        sim_director = 1.0 if df.iloc[i]['Director'] == df.iloc[j]['Director'] else 0.0
+        
+        # Genre Jaccard
+        genres1 = set(df.iloc[i]['Genre'])
+        genres2 = set(df.iloc[j]['Genre'])
+        sim_genre = len(genres1 & genres2) / len(genres1 | genres2) if genres1 | genres2 else 0
+        
+        # Stars Jaccard
+        stars1 = set(df.iloc[i]['Stars'])
+        stars2 = set(df.iloc[j]['Stars'])
+        sim_stars = len(stars1 & stars2) / len(stars1 | stars2) if stars1 | stars2 else 0
 
-    # director bonus
-    dir_sim = 1.0 if df.at[i,"Director"] == df.at[j,"Director"] and df.at[i,"Director"] else 0.0
-    # genre jaccard
-    set_gi, set_gj = set(df.at[i,"Genres"]), set(df.at[j,"Genres"])
-    genre_sim = len(set_gi & set_gj) / len(set_gi | set_gj) if (set_gi | set_gj) else 0.0
-    # stars jaccard
-    set_si, set_sj = set(df.at[i,"Stars"]), set(df.at[j,"Stars"])
-    stars_sim = len(set_si & set_sj) / len(set_si | set_sj) if (set_si | set_sj) else 0.0
+        # Weighted total
+        sim_total = (
+            EMB_WEIGHT * sim_emb +
+            DIRECTOR_WEIGHT * sim_director +
+            GENRE_WEIGHT * sim_genre +
+            STARS_WEIGHT * sim_stars
+        )
 
-   
-    score = (
-        W_OVERVIEW * ov_sim +
-        W_DIRECTOR * dir_sim +
-        W_GENRE * genre_sim +
-        W_STARS * stars_sim
-    )
+        if sim_total >= THRESHOLD:
+            G.add_edge(df.iloc[i]['Series_Title'], df.iloc[j]['Series_Title'], weight=sim_total)
 
-    edges.append({"title1": title_i, "title2": title_j, "weight": float(score)})
+# Community detection
+partition = community_louvain.best_partition(G, weight='weight')
+nx.set_node_attributes(G, partition, 'community')
 
-
-driver = GraphDatabase.driver(NEO4J_URI,
-                              auth=(NEO4J_USER, NEO4J_PASSWORD))
-
-def create_constraints(tx):
-    tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (m:Movie) REQUIRE m.title IS UNIQUE")
-    tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.name  IS UNIQUE")
-    tx.run("CREATE CONSTRAINT IF NOT EXISTS FOR (g:Genre)  REQUIRE g.name  IS UNIQUE")
-
-def ingest_movies(tx, records):
-    tx.run("""
-    UNWIND $rows AS row
-    MERGE (m:Movie {title: row.Series_Title})
-      SET m.released_year = toInteger(row.Released_Year),
-          m.certificate   = row.Certificate,
-          m.runtime       = row.Runtime,
-          m.imdb_rating   = toFloat(row.IMDB_Rating),
-          m.meta_score    = toInteger(row.Meta_score),
-          m.no_of_votes   = toInteger(row.No_of_Votes),
-          m.gross         = toFloat(row.Gross),
-          m.overview      = row.Overview
-    FOREACH (gName IN row.Genres |
-      MERGE (g:Genre {name: gName})
-      MERGE (m)-[:HAS_GENRE]->(g)
-    )
-    MERGE (d:Person {name: row.Director})
-    MERGE (m)-[:DIRECTED_BY]->(d)
-    FOREACH (star IN row.Stars |
-      MERGE (s:Person {name: star})
-      MERGE (m)-[:STARRING]->(s)
-    );
-    """, rows=records)
-
-def ingest_edges(tx, edges):
-    tx.run("""
-    UNWIND $edges AS e
-    MATCH (a:Movie {title: e.title1}), (b:Movie {title: e.title2})
-    MERGE (a)-[r:SIMILAR_OVERVIEW]-(b)
-      SET r.weight = e.weight
-    """, edges=edges)
-
+# Push to Neo4j
+driver = GraphDatabase.driver(URI, auth=(USER, PASSWORD))
 with driver.session() as session:
+    session.run("MATCH (n) DETACH DELETE n")
 
-    session.write_transaction(create_constraints)
-  
-    session.write_transaction(ingest_movies, df.to_dict("records"))
+    for node, data in tqdm(G.nodes(data=True), desc="Creating nodes"):
+        session.run("""
+            MERGE (m:Movie {title: $title})
+            SET m.community = $community,
+                m.director = $director,
+                m.rating = $rating,
+                m.genre = $genre,
+                m.stars = $stars
+        """, {
+            'title': data['title'],
+            'community': data['community'],
+            'director': data['director'],
+            'rating': data['rating'],
+            'genre': ", ".join(data['genre']),
+            'stars': ", ".join(data['stars']),
+        })
 
-    session.write_transaction(ingest_edges, edges)
+    for u, v, data in tqdm(G.edges(data=True), desc="Creating edges"):
+        session.run("""
+            MATCH (m1:Movie {title: $u})
+            MATCH (m2:Movie {title: $v})
+            MERGE (m1)-[r:SIMILAR_TO]->(m2)
+            SET r.weight = $weight
+        """, {'u': u, 'v': v, 'weight': data['weight']})
 
 driver.close()
-print(f"Ingested {len(df)} movies and {len(edges)} similarity edges into Neo4j.")
